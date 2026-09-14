@@ -1,0 +1,757 @@
+backend/src/middleware/http-logger.middleware.ts
+import { Inject, Injectable, NestMiddleware } from '@nestjs/common';
+import { NextFunction, Request, Response } from 'express';
+import { APP_LOGGER } from '../logger/app-logger';
+import type { AppLogger } from '../logger/app-logger';
+import { RequestContextService } from '../requestContext.service';
+import type { RequestErrorContext } from '../logger/log-line';
+
+export const REQUEST_ID_HEADER = 'x-request-id';
+
+/**
+ * 例外フィルタが結果を積む Request。
+ *
+ * requestId / userId は AsyncLocalStorage へ移したのでここには持たない。
+ * どちらも同じリクエストの中なので ALS でも運べるが、「1 リクエストに
+ * 1 個しか無い可変の受け渡し箱」であって context (リクエストの素性) ではない
+ * ので request に置いたままにしている。
+ */
+export interface RequestWithErrorInfo extends Request {
+  errorInfo?: RequestErrorContext;
+}
+
+/**
+ * クライアント IP。nginx / compose 経由だと socket は上流のものになるので
+ * x-forwarded-for の先頭を優先する。取れなければ空文字。
+ */
+function clientIpOf(req: Request): string {
+  const xff = req.headers['x-forwarded-for'];
+  const first = Array.isArray(xff) ? xff[0] : xff;
+  if (first) return first.split(',')[0].trim();
+  return req.socket?.remoteAddress ?? '';
+}
+
+@Injectable()
+export class HttpLoggerMiddleware implements NestMiddleware {
+  constructor(
+    // 具象クラスではなく token で受ける。
+// pino などへ差し替えてもここは触らずに済む。
+    @Inject(APP_LOGGER) private readonly logger: AppLogger,
+    private readonly requestContext: RequestContextService,
+  ) {}
+
+  use(req: RequestWithErrorInfo, res: Response, next: NextFunction) {
+    const header = req.headers[REQUEST_ID_HEADER];
+    const context = this.requestContext.create({
+      clientIp: clientIpOf(req),
+      UserAgent: req.headers['user-agent'],
+      requestId: Array.isArray(header) ? header[0] : header,
+    });
+    res.setHeader(REQUEST_ID_HEADER, context.requestId);
+
+    const startedAt = Date.now();
+    res.on('finish', () => {
+      // 例外フィルタが積んだものを拾う。filter はレスポンス送出時に走るので
+      // finish の時点では必ず入っている。無ければ error キーは出力されない。
+      const errorInfo = req.errorInfo;
+
+      // finish は res.end() を呼んだ側の文脈で emit される。ふつうはハンドラ
+      // (= context の中) だが、そうならない経路もあるので **作った context に
+      // 明示的に入り直す**。ここを ALS 任せにすると requestId が空の行が
+      // まれに出て、原因が分からなくなる。
+      this.requestContext.run(context, () =>
+        this.logger.httpAccess(
+          {
+            method: req.method,
+            path: req.originalUrl,
+            status: res.statusCode,
+            durationMs: Date.now() - startedAt,
+          },
+          { message: errorInfo?.message, error: errorInfo?.error },
+        ),
+      );
+    });
+
+    // 以降の middleware / guard / controller / service はすべてこの中で走る。
+    this.requestContext.run(context, () => next());
+  }
+}
+
+
+backend/src/redis/redis.service.ts
+import { Injectable } from '@nestjs/common';
+import Redis from 'ioredis';
+import { RequestContextService } from '../requestContext.service';
+// import * as RedisSession from './redis-session.js';
+@Injectable()
+export class RedisService {
+  private readonly redis = new Redis(process.env.REDIS_URL);
+  private readonly options = {
+    client: this.redis,
+    ttl: parseInt(process.env.SESSION_EXPIRES, 10),
+  };
+  private readonly redisSession = new RedisSession(this.options);
+
+  constructor(private readonly requestContext: RequestContextService) {}
+
+  async createSession(_sessionId: string, _sessionData: any): Promise<void> {
+    await this.redisSession.set(_sessionId, _sessionData);
+    this.requestContext.setUserId(_sessionData?.userId);
+  }
+
+  async getSession(_sessionId: string): Promise<any> {
+    const sessionData = await this.redisSession.get(_sessionId);
+    if (!sessionData) return;
+    const newSession = await this.updateSession(_sessionId, sessionData);
+    this.redisSession.touch(_sessionId, newSession);
+    this.requestContext.setUserId(newSession?.userId);
+    return newSession;
+  }
+
+  async updateSession(_sessionId: string, _sessionData: any): Promise<any> {
+    const sess = _sessionData;
+    const newExpire = new Date(
+      Date.now() + parseInt(process.env.SESSION_EXPIRES, 10) * 1000,
+    );
+    sess.expires = newExpire;
+    this.redisSession.set(_sessionId, sess);
+    return sess;
+  }
+
+  async deleteSession(_sessionId: string): Promise<void> {
+    await this.redisSession.destroy(_sessionId);
+  }
+}
+
+class RedisSession {
+  private prefix;
+  private scanCount;
+  private serializer;
+  private client;
+  private ttl;
+  private disableTTL;
+  private disableTouch;
+  constructor(options: any) {
+    this.prefix = '';
+    this.scanCount = Number(options.scanCount) || 100;
+    this.serializer = options.serializer || JSON;
+    this.client = options.client;
+    this.ttl = options.ttl || 1800; // 30 minutes
+    this.disableTTL = options.disableTTL || false;
+    this.disableTouch = options.disableTouch || false;
+  }
+
+  async get(sid) {
+    const key = this.prefix + sid;
+
+    const data = await this.client.get(key);
+    if (!data) return null;
+
+    let value;
+    try {
+      value = this.serializer.parse(data);
+    } catch (err) {
+      return null;
+    }
+    return value;
+  }
+
+  async set(sid, sess) {
+    const args = [this.prefix + sid];
+
+    let value;
+    try {
+      value = this.serializer.stringify(sess);
+    } catch (er) {
+      return null;
+    }
+    args.push(value);
+
+    let ttl = 1;
+    if (!this.disableTTL) {
+      ttl = this._getTTL(sess);
+      args.push('EX', ttl);
+    }
+
+    if (ttl > 0) {
+      return await this.client.set(args);
+    } else {
+      // If the resulting TTL is negative we can delete / destroy the key
+      return await this.destroy(sid);
+    }
+  }
+
+  async touch(sid, sess) {
+    if (this.disableTouch || this.disableTTL) return null;
+    const key = this.prefix + sid;
+    const err = await this.client.expire(key, this._getTTL(sess));
+    return err;
+  }
+
+  async destroy(sid) {
+    const key = this.prefix + sid;
+    const err = await this.client.del(key);
+    return err;
+  }
+
+  async clear() {
+    const keys = await this.client.keys(this.prefix + '*');
+    if (!keys) return null;
+
+    keys.forEach(async (key) => {
+      await this.client.del(key);
+    });
+  }
+
+  _getTTL(sess) {
+    let ttl;
+    if (sess && sess.expires) {
+      const ms = Number(new Date(sess.expires)) - Date.now();
+      ttl = Math.ceil(ms / 1000);
+    } else {
+      ttl = this.ttl;
+    }
+    return ttl;
+  }
+}
+
+
+backend/src/logger/logger.module.ts
+import { Global, Module } from '@nestjs/common';
+import { APP_LOGGER } from './app-logger';
+import {
+  CustomLoggerService,
+  customLoggerOptions,
+} from './customLogger.service';
+import { RequestContextService } from '../requestContext.service';
+
+@Global()
+@Module({
+  providers: [
+    RequestContextService,
+    {
+      provide: APP_LOGGER,
+      useFactory: (requestContext: RequestContextService) =>
+        new CustomLoggerService(requestContext, customLoggerOptions),
+      inject: [RequestContextService],
+    },
+  ],
+  exports: [APP_LOGGER, RequestContextService],
+})
+export class LoggerModule {}
+
+
+backend/src/logger/app-logger.ts
+import type { LoggerService } from '@nestjs/common';
+import type { ErrorFields, HttpFields } from './log-line';
+
+export const APP_LOGGER = 'APP_LOGGER';
+
+export interface AppLogger extends LoggerService {
+  httpAccess(
+    http: HttpFields,
+    options?: { message?: string; error?: Partial<ErrorFields> },
+  ): void;
+}
+
+
+backend/src/logger/customLogger.service.ts
+import { Injectable, Optional } from '@nestjs/common';
+import { formatLogLine, severityFromStatus } from './log-line';
+import type { ErrorFields, HttpFields, LogFields } from './log-line';
+import { RequestContextService } from '../requestContext.service';
+import type { AppLogger } from './app-logger';
+
+export type Severity = 'info' | 'warn' | 'error' | 'debug';
+
+/**
+ * このクラスの小文字レベルを共通ログ行の severity へ写す。
+ * 共通形は front/back/nginx で 4 値の大文字にそろえてある。
+ */
+const SEVERITY_TO_COMMON: Record<Severity, LogFields['severity']> = {
+  info: 'INFO',
+  warn: 'WARN',
+  error: 'ERROR',
+  debug: 'DEBUG',
+};
+
+const DEFAULT_SEVERITIES: Severity[] = ['info', 'warn', 'error', 'debug'];
+
+type LogFormat = 'json' | 'text';
+
+export interface CustomLoggerOptions {
+  severities?: Severity[];
+
+  format?: LogFormat;
+}
+
+// export const customLoggerOptions: CustomLoggerOptions =
+//   process.env.NODE_ENV === 'development'
+//     ? { severities: ['debug', 'info', 'warn', 'error'], format: 'text' }
+//     : { severities: ['info', 'warn', 'error'], format: 'json' };
+
+// on-testing
+export const customLoggerOptions: CustomLoggerOptions = {
+  severities: ['debug', 'info', 'warn', 'error'],
+  format: 'json',
+};
+
+type ColorTextFn = (text: string) => string;
+
+const isColorAllowed = () => !process.env.NO_COLOR;
+const colorIfAllowed = (colorFn: ColorTextFn) => (text: string) =>
+  isColorAllowed() ? colorFn(text) : text;
+
+const clc = {
+  bold: colorIfAllowed((text: string) => `\x1B[1m${text}\x1B[0m`),
+  green: colorIfAllowed((text: string) => `\x1B[32m${text}\x1B[39m`),
+  yellow: colorIfAllowed((text: string) => `\x1B[33m${text}\x1B[39m`),
+  red: colorIfAllowed((text: string) => `\x1B[31m${text}\x1B[39m`),
+  magentaBright: colorIfAllowed((text: string) => `\x1B[95m${text}\x1B[39m`),
+  cyanBright: colorIfAllowed((text: string) => `\x1B[96m${text}\x1B[39m`),
+};
+
+const yellow = colorIfAllowed((text: string) => `\x1B[38;5;3m${text}\x1B[39m`);
+
+const isPlainObject = (fn: unknown): fn is object => {
+  if (typeof fn !== 'object') {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(fn);
+  if (proto === null) {
+    return true;
+  }
+  const ctor =
+    Object.prototype.hasOwnProperty.call(proto, 'constructor') &&
+    proto.constructor;
+  return (
+    typeof ctor === 'function' &&
+    ctor instanceof ctor &&
+    Function.prototype.toString.call(ctor) ===
+      Function.prototype.toString.call(Object)
+  );
+};
+
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  hour: 'numeric',
+  minute: 'numeric',
+  second: 'numeric',
+  day: '2-digit',
+  month: '2-digit',
+});
+
+@Injectable()
+export class CustomLoggerService implements AppLogger {
+  protected options: CustomLoggerOptions;
+  /** log() の呼び出しで context 引数が無かったときに使う既定値。 */
+  protected context?: string;
+
+  constructor(
+    private readonly requestContext: RequestContextService,
+    @Optional() options: CustomLoggerOptions = customLoggerOptions,
+  ) {
+    this.options = {
+      ...options,
+      severities: options.severities ?? DEFAULT_SEVERITIES,
+      format: options.format ?? 'text',
+    };
+  }
+
+  /**
+   * Write a 'log' level log, if the configured level allows for it.
+   * Prints to `stdout` with newline.
+   */
+  log(message: unknown, ...metadata: [...any, string?]): void;
+  log(message: unknown, ...metadata: any[]): void {
+    if (!this.isLevelEnabled('info')) {
+      return;
+    }
+    const { messages, context } = this.getContextAndMessagesToPrint([
+      message,
+      ...metadata,
+    ]);
+    if (this.options.format === 'text') {
+      this.printMessages(messages, context, 'info');
+    } else {
+      this.printMessagesAsJson(messages, context, '', 'info');
+    }
+  }
+
+  debug(message: unknown, ...metadata: [...any, string?]): void;
+  debug(message: unknown, ...metadata: any[]): void {
+    if (!this.isLevelEnabled('debug')) {
+      return;
+    }
+    const { messages, context } = this.getContextAndMessagesToPrint([
+      message,
+      ...metadata,
+    ]);
+    if (this.options.format === 'text') {
+      this.printMessages(messages, context, 'debug');
+    } else {
+      this.printMessagesAsJson(messages, context, '', 'debug');
+    }
+  }
+
+  warn(message: unknown, ...metadata: [...any, string?]): void;
+  warn(message: unknown, ...metadata: any[]): void {
+    if (!this.isLevelEnabled('warn')) {
+      return;
+    }
+    const { messages, context } = this.getContextAndMessagesToPrint([
+      message,
+      ...metadata,
+    ]);
+    if (this.options.format === 'text') {
+      this.printMessages(messages, context, 'warn');
+    } else {
+      this.printMessagesAsJson(messages, context, '', 'warn');
+    }
+  }
+
+  error(message: unknown, stackOrContext?: string): void;
+  error(message: unknown, stack?: string, context?: string): void;
+  error(message: unknown, ...metadata: any[]): void;
+  error(message: unknown, ...metadata: any[]): void {
+    if (!this.isLevelEnabled('error')) {
+      return;
+    }
+    const { messages, context, stack } =
+      this.getContextAndStackAndMessagesToPrint([message, ...metadata]);
+
+    if (this.options.format === 'text') {
+      this.printMessages(messages, context, 'error');
+      this.printStackTrace(stack);
+    } else {
+      this.printMessagesAsJson(messages, context, stack, 'error');
+    }
+  }
+
+  setContext(context: string) {
+    this.context = context;
+  }
+
+  /** setContext で付けた既定 context を外す。 */
+  resetContext() {
+    this.context = undefined;
+  }
+
+  isLevelEnabled(level: Severity): boolean {
+    const logLevels = this.options?.severities;
+    return logLevels.includes(level);
+  }
+
+  protected printMessages(
+    messages: unknown[],
+    context = '',
+    severity: Severity = 'info',
+    writeStreamType?: 'stdout' | 'stderr',
+  ) {
+    messages.forEach((message) => {
+      const pidMessage = this.formatPid(process.pid);
+      const contextMessage = this.formatContext(context);
+      const formattedSeverity = severity.toUpperCase().padStart(7, ' ');
+      const formattedMessage = this.formatMessage(
+        severity,
+        message,
+        pidMessage,
+        formattedSeverity,
+        contextMessage,
+      );
+      this.write(formattedMessage, writeStreamType ?? 'stdout');
+    });
+  }
+
+  /**
+   * JSON モードの出力。**共通ログ行と同じキー・順序**にそろえてある
+   * (logger/log-line.ts の LogFields)。
+   *
+   * Nest 内部のログ (起動時のルート表など) もこのメソッドを通るので、
+   * 形を変えると Fluent Bit が拾う JSON が 2 種類になり、OpenSearch の
+   * マッピングが安定しなくなる。以前は {pid, severity, timestamp, context,
+   * message, stack} という別スキーマだった。
+   *
+   * アクセスログではないので method / path / status / durationMs は付かない。
+   * `context` (Nest が付ける発生源) は共通キーに無いため message 側へ畳む。
+   *
+   * clientIp / requestId / userId / UserAgent は **AsyncLocalStorage から**
+   * 補う。これにより service 層が出した 1 行も、同じリクエストのアクセスログと
+   * 同じ requestId で並ぶ。リクエスト外 (起動ログなど) では context が無いので
+   * 従来どおり空文字になる。
+   */
+  protected printMessagesAsJson(
+    messages: unknown[],
+    context = '',
+    stack = '',
+    severity: Severity = 'info',
+  ) {
+    const request = this.requestContext.get();
+    messages.forEach((message) => {
+      const text =
+        typeof message === 'string' ? message : JSON.stringify(message);
+      this.writeLogLine(
+        {
+          clientIp: request?.clientIp,
+          severity: SEVERITY_TO_COMMON[severity],
+          requestId: request?.requestId,
+          userId: request?.userId,
+          // 「どこが出したか」を落とさないよう [RouterExplorer] 形式で前置する
+          message: context ? `[${context}] ${text}` : text,
+          UserAgent: request?.UserAgent,
+        },
+        {},
+        // stack があるものだけ error を付ける。無ければキー自体が出ない。
+        stack ? { code: '', type: '', detail: '', stack } : undefined,
+      );
+    });
+  }
+
+  /**
+   * HTTP アクセスログ 1 行 (`event: 'http_request'`)。
+   * HttpLoggerMiddleware が res の finish 時に 1 回だけ呼ぶ。
+   *
+   * まるごと消える。アクセスログは全件残す前提の別系統なので素通しにする。
+   *
+   * format が 'text' でも共通 JSON 行で出す。開発時に 1 行だけ JSON まざる
+   *
+   * 共通項目は AsyncLocalStorage から取る。middleware は finish が ALS の外で
+   * emit されうることを見越して、context に入り直してからここを呼んでいる。
+   */
+  httpAccess(
+    http: HttpFields,
+    options: { message?: string; error?: Partial<ErrorFields> } = {},
+  ): void {
+    const request = this.requestContext.get();
+    this.writeLogLine(
+      {
+        clientIp: request?.clientIp,
+        severity: severityFromStatus(http.status),
+        event: 'http_request',
+        requestId: request?.requestId,
+        userId: request?.userId,
+        // エラー時は利用者に見せた文言。正常時は空。
+        message: options.message,
+        UserAgent: request?.UserAgent,
+      },
+      http,
+      options.error,
+    );
+  }
+
+  protected printStackTrace(stack: string) {
+    if (!stack) {
+      return;
+    }
+    this.write(`${stack}\n`, 'stderr');
+  }
+
+  /**
+   * このクラスから出る書き出しは **全部ここを通す**。
+   */
+  private write(text: string, stream: 'stdout' | 'stderr' = 'stdout'): void {
+    process[stream].write(text);
+  }9w
+
+  /**
+   * 共通ログ行 1 行を書き出す。
+   */
+  private writeLogLine(
+    partial: Partial<LogFields> = {},
+    extra: Partial<HttpFields> = {},
+    error?: Partial<ErrorFields>,
+  ): void {
+    this.write(formatLogLine(partial, extra, error) + '\n');
+  }
+
+  protected formatPid(pid: number): string {
+    return `[Nest] ${pid}  - `;
+  }
+
+  protected formatContext(context: string): string {
+    return context ? yellow(`[${context}]`) : '';
+  }
+
+  protected formatMessage(
+    severity: Severity,
+    message: unknown,
+    pidMessage: string,
+    formattedSeverity: string,
+    contextMessage: string,
+  ) {
+    const output = this.stringifyMessage(message, severity);
+    pidMessage = this.colorize(pidMessage, severity);
+    formattedSeverity = this.colorize(formattedSeverity, severity);
+
+    return `${pidMessage}${this.getTimestamp()} ${formattedSeverity} ${contextMessage}${output}\n`;
+  }
+
+  protected getColorBySeverity(severity: Severity) {
+    switch (severity) {
+      case 'debug':
+        return clc.magentaBright;
+      case 'warn':
+        return clc.yellow;
+      case 'error':
+        return clc.red;
+      default:
+        return clc.green;
+    }
+  }
+
+  protected colorize(message: string, severity: Severity) {
+    const color = this.getColorBySeverity(severity);
+    return color(message);
+  }
+
+  /**
+   * メッセージの処理
+   */
+
+  protected stringifyMessage(message: unknown, severity: Severity) {
+    if (typeof message === 'function') {
+      const messageAsStr = Function.prototype.toString.call(message); //nestJS本家の実装に合わせる
+
+      const isClass = messageAsStr.startsWith('class ');
+      if (isClass) {
+        return this.stringifyMessage(message.name, severity);
+      }
+
+      return this.stringifyMessage(message(), severity);
+    }
+
+    return isPlainObject(message) || Array.isArray(message)
+      ? `${this.colorize('Object:', severity)}\n${JSON.stringify(message, (key, value) => (typeof value === 'bigint' ? value.toString() : value), 2)}\n` //()を追加
+      : this.colorize(message as string, severity);
+  }
+
+  private getContextAndMessagesToPrint(args: unknown[]) {
+    if (args.length <= 1) {
+      return { messages: args, context: this.context };
+    }
+
+    const lastElement = args[args.length - 1];
+    const isContext = typeof lastElement === 'string';
+    if (!isContext) {
+      return { message: args, context: this.context };
+    }
+
+    return {
+      context: lastElement as string,
+      messages: args.slice(0, args.length - 1),
+    };
+  }
+
+  private getContextAndStackAndMessagesToPrint(args: unknown[]) {
+    if (args.length === 2) {
+      if (args[1] instanceof Error) {
+        return {
+          messages: [args[0]],
+          stack: args[1].stack,
+          context: this.context,
+        };
+      }
+      return this.isStackFormat(args[1])
+        ? {
+            messages: [args[0]], //0が正しい？
+            stack: args[1] as string,
+            context: this.context,
+          }
+        : {
+            messages: [args[0]],
+            context: args[1] as string,
+          };
+    }
+    const { messages, context } = this.getContextAndMessagesToPrint(args);
+
+    if (messages?.length < 1) {
+      return { messages, context };
+    }
+
+    const lastElement = messages[messages.length - 1];
+
+    if (lastElement instanceof Error) {
+      return {
+        messages: messages.slice(0, messages.length - 1),
+        stack: lastElement.stack,
+        context: context,
+      };
+    }
+
+    const isStack = this.isStackFormat(lastElement);
+    if (!isStack) {
+      return { messages, context };
+    }
+    return {
+      stack: lastElement as string,
+      messages: messages.slice(0, messages.length - 1),
+      context,
+    };
+  }
+
+  private isStackFormat(stack: unknown) {
+    if (typeof stack !== 'string' && typeof stack !== 'undefined') {
+      return false;
+    }
+
+    return /^(.)+\n\s+at .+:\d+:\d+$/.test(stack);
+  }
+
+  protected getTimestamp(): string {
+    return dateTimeFormatter.format(Date.now());
+  }
+}
+
+
+
+
+
+backend/src/requestContext.service.ts
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
+import { Injectable } from '@nestjs/common';
+
+export interface RequestContext {
+  clientIp: string;
+  /** 共通ログ行のキーに合わせて大文字始まり。 */
+  UserAgent: string;
+  requestId: string;
+  userId: string;
+}
+
+const storage = new AsyncLocalStorage<RequestContext>();
+
+/** undefined / null を空文字に落とす。 */
+const s = (v: unknown): string =>
+  v === undefined || v === null ? '' : String(v);
+
+@Injectable()
+export class RequestContextService {
+  create(seed: Partial<RequestContext> = {}): RequestContext {
+    return {
+      clientIp: s(seed.clientIp),
+      UserAgent: s(seed.UserAgent),
+      requestId: s(seed.requestId) || randomUUID(),
+      userId: s(seed.userId),
+    };
+  }
+
+  /** context を張ってから fn を実行する。fn の中の非同期処理にも引き継がれる。 */
+  run<T>(context: RequestContext, fn: () => T): T {
+    return storage.run(context, fn);
+  }
+
+  get(): RequestContext | undefined {
+    return storage.getStore();
+  }
+
+  setUserId(userId: unknown): void {
+    const context = storage.getStore();
+    const value = s(userId);
+    if (!context || !value) return;
+    context.userId = value;
+  }
+}
+
+
+
