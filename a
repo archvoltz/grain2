@@ -1,1 +1,1482 @@
+import type { AppErrorCode } from '../interfaces/error-response.interface';
 
+export type LogEvent =
+  | 'http_request' // HTTP リクエスト 1 件の完了ごと（成否によらず）
+  | 'login_succeeded'
+  | 'login_failed'
+  | 'logout'
+  | 'app_started';
+// 行動分析で使う予定の予約語（実装するまで使わない）:
+//   page_viewed / element_clicked / session_started / session_ended
+
+/** 全ログ共通のキー。順序もこの通りに出力する。 */
+export interface LogFields {
+  clientIp: string;
+  timestamp: string; // ISO8601 UTC
+  severity: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG';
+  service: string;
+  version: string;
+  event: LogEvent | '';
+  requestId: string;
+  userId: string;
+  message: string;
+  UserAgent: string; // 指定どおり大文字始まり
+}
+
+/** HTTP アクセスログだけが足す項目。 */
+export interface HttpFields {
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+}
+
+export interface ErrorFields {
+  code: AppErrorCode | ''; // front/back で語彙共通
+  type: string; // 例外クラス名
+  detail: string; // 内部向け補足
+  stack: string; // ログには常に入れる。クライアントへ返さないだけ
+}
+
+export interface RequestErrorContext {
+  message: string;
+  error: ErrorFields;
+}
+
+export function appErrorCodeFromStatus(status: number): AppErrorCode {
+  switch (status) {
+    case 400:
+      return 'BAD_REQUEST';
+    case 401:
+      return 'UNAUTHORIZED';
+    case 403:
+      return 'FORBIDDEN';
+    case 404:
+      return 'NOT_FOUND';
+    case 409:
+      return 'CONFLICT';
+    case 422:
+      return 'VALIDATION_ERROR';
+    case 429:
+      return 'RATE_LIMITED';
+    default:
+      return status >= 500 ? 'INTERNAL_ERROR' : 'UNKNOWN_ERROR';
+  }
+}
+
+/**
+ * HTTP ステータス → `severity`。
+ *
+ * `appErrorCodeFromStatus` と同じく「ステータスから決まる語彙」なので隣に置く。
+ * 4xx を WARN にしているのは、クライアント起因の失敗で ERROR の件数を
+ * 膨らませないため (アラートはサーバ起因の 5xx で鳴らしたい)。
+ */
+export function severityFromStatus(status: number): LogFields['severity'] {
+  if (status >= 500) return 'ERROR';
+  if (status >= 400) return 'WARN';
+  return 'INFO';
+}
+
+/**
+ * service / version は **呼ばれるたびに読む**。モジュール読み込み時に定数へ
+ * 束ねると、ConfigModule.forRoot() が .env を読むより前に評価されてしまい、
+ * 常に既定値になる (実際に version が 0.0.0 のまま出て気づいた)。
+ */
+const serviceName = () => process.env.LOG_SERVICE || 'w3x-api';
+const appVersion = () => process.env.APP_VERSION || '0.0.0';
+
+/** stack の最大長。_source の保存量と転送量を抑えるため。 */
+export const STACK_MAX_BYTES = 4096;
+
+/** undefined / null を空文字に落とす。 */
+const s = (v: unknown): string =>
+  v === undefined || v === null ? '' : String(v);
+
+/** stack を 4KB で切る。切ったことが分かるよう印を残す。 */
+export function truncateStack(stack: unknown): string {
+  const text = s(stack);
+  if (Buffer.byteLength(text, 'utf8') <= STACK_MAX_BYTES) return text;
+  // マルチバイトの途中で切れないよう Buffer 単位で詰めてから復元する
+  const cut = Buffer.from(text, 'utf8')
+    .subarray(0, STACK_MAX_BYTES)
+    .toString('utf8');
+  return `${cut}\n...[truncated at ${STACK_MAX_BYTES} bytes]`;
+}
+
+/** 共通フィールドを既定値で埋めて返す。 */
+export function buildLogFields(partial: Partial<LogFields> = {}): LogFields {
+  return {
+    clientIp: s(partial.clientIp),
+    timestamp: partial.timestamp || new Date().toISOString(),
+    severity: partial.severity || 'INFO',
+    service: partial.service || serviceName(),
+    version: partial.version || appVersion(),
+    event: partial.event || '',
+    requestId: s(partial.requestId),
+    userId: s(partial.userId),
+    message: s(partial.message),
+    UserAgent: s(partial.UserAgent),
+  };
+}
+
+/**
+ * 1 行の JSON にする。改行を含めないこと（1 リクエスト 1 行が前提）。
+ * `error` はエラー時のみ渡す。渡さなければキー自体が出ない。
+ */
+export function formatLogLine(
+  partial: Partial<LogFields> = {},
+  extra: Partial<HttpFields> = {},
+  error?: Partial<ErrorFields>,
+): string {
+  const merged: Record<string, unknown> = { ...buildLogFields(partial) };
+
+  // HTTP 項目は存在するときだけ、共通項目の後ろに足す
+  if (extra.method !== undefined) merged.method = s(extra.method);
+  if (extra.path !== undefined) merged.path = s(extra.path);
+  if (extra.status !== undefined) merged.status = extra.status;
+  if (extra.durationMs !== undefined) merged.durationMs = extra.durationMs;
+
+  if (error) {
+    merged.error = {
+      code: s(error.code),
+      type: s(error.type),
+      detail: s(error.detail),
+      stack: truncateStack(error.stack),
+    };
+  }
+  return JSON.stringify(merged);
+}
+
+
+==============
+import {
+  ArgumentsHost,
+  Catch,
+  ExceptionFilter,
+  HttpException,
+  HttpStatus,
+} from '@nestjs/common';
+import { Response } from 'express';
+import { ErrorResponse } from '../interfaces/error-response.interface';
+import { appErrorCodeFromStatus } from '../logger/log-line';
+import type { RequestErrorContext } from '../logger/log-line';
+import { RequestWithErrorInfo } from '../middleware/http-logger.middleware';
+
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<RequestWithErrorInfo>();
+
+    const status =
+      exception instanceof HttpException
+        ? exception.getStatus()
+        : HttpStatus.INTERNAL_SERVER_ERROR;
+
+    const body: ErrorResponse = {
+      statusCode: status,
+      code: appErrorCodeFromStatus(status),
+      message: this.extractMessage(exception),
+      timestamp: new Date().toISOString(),
+    };
+
+    // **ここではログを出さない**。内容を request に積むだけにして、実際の出力は
+    // HttpLoggerMiddleware が res の finish 時に 1 リクエスト 1 行として出す。
+    // こうしないと 1 回の失敗で複数ドキュメントが別々の形で OpenSearch に入る。
+    //
+    // stack はログには常に入れる。クライアントへ返さないだけ。
+    const errorContext: RequestErrorContext = {
+      message: body.message,
+      error: {
+        code: body.code,
+        type:
+          exception instanceof Error
+            ? exception.constructor.name
+            : typeof exception,
+        detail: this.internalDetailOf(exception, body.message),
+        // 切り詰めはここではやらない。formatLogLine が書き出し直前に
+        // 4KB で切る唯一の場所なので、ここでも切ると印が二重に付く。
+        stack:
+          exception instanceof Error
+            ? (exception.stack ?? '')
+            : String(exception),
+      },
+    };
+    request.errorInfo = errorContext;
+
+    response.status(status).json(body);
+  }
+
+  /**
+   * `error.detail` … クライアントに返した文言と違う、例外そのものの文言。
+   *
+   * 未知の例外は extractMessage が固定文へ丸めるので、`message` だけ見ても
+   * 何が起きたか分からない。かといって毎回 `stack` を読むのは重い。
+   * 差分があるときだけ生の文言を置いて、500 の原因を一覧で追えるようにする。
+   */
+  private internalDetailOf(exception: unknown, clientMessage: string): string {
+    if (!(exception instanceof Error)) return '';
+    const raw = exception.message;
+    if (!raw || raw === clientMessage) return '';
+    // この repo の controller は `new HttpException({ status, error: 'KEY' }, status)`
+    // の形で投げる。レスポンスオブジェクトに message が無いので Nest が
+    // `.message` に埋める既定の文言がそのまま残り、detail に毎回同じ文字列が
+    // 入ってしまう。中身が無いので落とす。
+    if (raw === 'Http Exception') return '';
+    return raw;
+  }
+
+  /**
+   * 例外からユーザ用メッセージを取り出す。
+   * HttpException の getResponse() は string | { message: string | string[] } の
+   * 揺れがあるため吸収する。未知の例外は固定にする (内部情報の漏洩防止)。
+   *
+   * この repo の controller は `{ status, error: 'USERID_PASSWORD_REQUIRED' }`
+   * のように **`error` にフロント用のキー**を入れて投げる箇所が多い。
+   * admin の utils/error/index.ts がそのキーで i18n を引くので、
+   * `message` が無いときは `error` を拾って文言を殺さないようにする。
+   */
+  private extractMessage(exception: unknown): string {
+    if (exception instanceof HttpException) {
+      const res = exception.getResponse();
+      if (typeof res === 'string') return res;
+      if (res && typeof res === 'object') {
+        const r = res as Record<string, unknown>;
+        if (r.message !== undefined) return String(r.message);
+        if (r.error !== undefined) return String(r.error);
+      }
+      return exception.message;
+    }
+    return 'サーバ内部でエラーが発生しました。';
+  }
+}
+
+
+
+# Express-Master ロードマップ
+
+Express は Node.js 環境で最も人気のある Web フレームワークであり、HTTT-Master (HTTP Tool Training Hub) の重要なカリキュラムの一つです。軽量でありながら拡張性が高く、シンプルな API から大規模な Web アプリケーションまで幅広く利用されています。
+
+## HTTT-Master 全体での位置づけ
+
+HTTT-Master エコシステムにおける Express の役割は以下の通りです。
+
+*   **Express**: サーバーサイド HTTP フレームワーク (リクエストを受けて処理する側)
+*   **Undici / Ofetch**: クライアントサイド HTTP (リクエストを送る側)
+*   **H3**: 軽量サーバーサイド (Nuxt/Nitro向け)
+
+Web 開発の全体像を掴むため、まずはサーバーサイドである Express を学習し、その後クライアントサイドの Undici/Ofetch を学ぶことでフルスタックな理解を深める順序を推奨します。
+
+## このロードマップの読み方
+
+各 Step は次の構成になっています。
+
+| 記号 | 意味 |
+| :--- | :--- |
+| **学習内容** | その Step で身につける概念と API |
+| **コマンド/コード** | 手を動かす最小の例 |
+| ✅ **チェックポイント** | 次に進んでよいかの自己判定 |
+| 🔰 **実務 Tips** | 現場で効いてくる勘所 |
+| 🔍 **デバッグ** | その Step で必ず踏む失敗と、原因を特定するための API・コマンド |
+
+🔍 のブロックは「詰まってから読む」のではなく、**うまく動いているうちに一度試しておく**のが目的です。正常時の出力を知らないと、異常時の出力が異常だと判断できません。巻末に「詰まったときの逆引き表」と「デバッグ API / コマンド チートシート」があります。
+
+## 前提条件
+
+*   Node.js v20 以上 (LTS推奨, v22+ で `--watch` フラグ利用可)
+*   npm または pnpm
+*   テキストエディタ (VS Code 推奨, REST Client 拡張機能インストール推奨)
+*   JavaScript の基本文法 (変数, 関数, 配列, オブジェクト, async/await)
+*   ターミナル操作の基礎
+*   バージョン確認コマンド:
+    ```bash
+    node -v
+    npm -v
+    ```
+
+### 先に揃えておくデバッグ道具
+
+| 道具 | 用途 | 確認コマンド |
+| :--- | :--- | :--- |
+| `curl` | 生の HTTP を見る・送る (Windows 10 以降は標準搭載) | `curl --version` |
+| VS Code REST Client / Thunder Client | `.http` ファイルでリクエストを保存・再送 | 拡張機能から導入 |
+| Node.js Inspector | ブレークポイントを張って変数を見る | `node --inspect index.js` |
+| `DEBUG` 環境変数 | Express 内部のルーティング判定ログ | `DEBUG=express:* node index.js` |
+| ブラウザ DevTools (Network) | ブラウザから叩いたときの実リクエスト | F12 |
+
+> PowerShell では `curl` が `Invoke-WebRequest` のエイリアスになっている場合があります。本ロードマップの `curl` は本物の curl を指すため、PowerShell では `curl.exe` と明示してください。
+>
+> ```powershell
+> curl.exe -i http://localhost:3000/
+> ```
+
+## 入門レベル (Beginner) 📗
+
+所要時間: 1〜2週間
+目標: Express の基本概念を理解し、シンプルなAPIサーバーを立ち上げることができる。加えて、動かないときに「どこで止まっているか」を自力で切り分けられる。
+プロジェクト: メモ帳 API v1 (インメモリデータ)
+
+### Step 1: プロジェクトの初期化とバージョンの確定
+
+*   **学習内容**:
+    *   Node.js プロジェクトのセットアップ
+    *   Express のインストール
+    *   ES Modules の有効化 (`type: "module"`)
+    *   **メジャーバージョンの確認** (Express 4 系と 5 系で挙動が異なる)
+*   **コマンド/コード**:
+    ```bash
+    mkdir express-memo-api
+    cd express-memo-api
+    npm init -y
+    npm install express
+    ```
+    `package.json` に `"type": "module"` を追加します。
+    ```json
+    {
+      "name": "express-memo-api",
+      "type": "module",
+      "dependencies": {
+        "express": "^4.21.0"
+      }
+    }
+    ```
+*   ✅ **チェックポイント**: `package.json` が生成され、`express` が `dependencies` に追加されていること。
+*   🔍 **デバッグ**: ネット上のサンプルが動かない原因の多くは**バージョン違い**です。着手時に自分が何を使っているかを固定してください。
+    ```bash
+    npm ls express
+    ```
+    Express 4 系と 5 系ではワイルドカードのパス記法や非同期エラーの扱いなどが異なります。学習中に「ドキュメント通りに書いたのに動かない」場合は、まず**読んでいるドキュメントのバージョンと手元のバージョンが一致しているか**を疑ってください。本ロードマップのサンプルは 4 系を前提に記述しています。
+
+### Step 2: 最初のサーバー起動
+
+*   **学習内容**:
+    *   `express()` インスタンスの作成
+    *   `app.get()` によるシンプルなルーティング
+    *   `app.listen()` によるサーバー起動とポート番号
+    *   listen 失敗時のエラーハンドリング
+*   **コマンド/コード**:
+    `index.js` を作成します。
+    ```javascript
+    import express from 'express';
+    const app = express();
+    const port = process.env.PORT || 3000;
+
+    app.get('/', (req, res) => {
+      res.send('Hello World!');
+    });
+
+    const server = app.listen(port, () => {
+      console.log(`Server is running at http://localhost:${port}`);
+    });
+
+    // 起動失敗を握りつぶさない
+    server.on('error', (err) => {
+      console.error('listen failed:', err.code, err.message);
+      process.exit(1);
+    });
+    ```
+    実行: `node index.js`
+*   ✅ **チェックポイント**: ブラウザまたは curl で `http://localhost:3000` にアクセスし、「Hello World!」が表示されること。
+*   🔰 **実務 Tips**: 実務ではポート番号を環境変数 `PORT` から取得するのが一般的です (`process.env.PORT || 3000`)。
+*   🔍 **デバッグ**: 起動できないときの典型は 2 つです。
+
+    | エラー | 意味 | 対処 |
+    | :--- | :--- | :--- |
+    | `EADDRINUSE` | そのポートは既に使用中 | 前回のプロセスが残っている。下記で特定して終了する |
+    | `EACCES` | ポートの使用権限がない | 1024 未満のポートは管理者権限が必要。3000 番台を使う |
+
+    Windows (PowerShell) でポートを掴んでいるプロセスを特定する:
+    ```powershell
+    Get-Process -Id (Get-NetTCPConnection -LocalPort 3000 -State Listen).OwningProcess
+    ```
+    「起動ログは出ているのにブラウザから繋がらない」場合は listen アドレスを疑ってください。`app.listen(port, '127.0.0.1')` はローカルからのみ、`'0.0.0.0'` は外部 (別端末や Docker ホスト) からも到達できます。
+
+### Step 3: 開発環境の整備
+
+*   **学習内容**:
+    *   ファイル変更の自動検知によるサーバー再起動
+    *   npm scripts の設定
+    *   API 動作確認ツールの準備 (VS Code REST Client など)
+    *   デバッガ起動用の script を最初から用意しておく
+*   **コマンド/コード**:
+    `package.json` の `scripts` を編集します。
+    ```json
+    "scripts": {
+      "start": "node index.js",
+      "dev": "node --watch index.js",
+      "debug": "node --watch --inspect index.js"
+    }
+    ```
+    ※ Node.js v22 未満の場合は `npm install -D nodemon` を行い、`"dev": "nodemon index.js"` とします。
+
+    `requests.http` を作り、確認したリクエストを資産として残します (VS Code REST Client)。
+    ```http
+    ### 一覧取得
+    GET http://localhost:3000/memos
+
+    ### 作成
+    POST http://localhost:3000/memos
+    Content-Type: application/json
+
+    { "title": "test", "content": "hello" }
+    ```
+*   ✅ **チェックポイント**: `npm run dev` でサーバーを起動し、コードを変更して保存すると自動で再起動されること。
+*   🔍 **デバッグ**: `--watch` 使用時、**構文エラーで再起動に失敗しているのにターミナルを見ておらず、古い挙動が続いている**と勘違いするのがよくある事故です。挙動が変わらないときは、まずターミナルの最終行を読んでください。再起動が走った形跡がなければ、コードは反映されていません。
+
+### Step 4: リクエストとレスポンスを「見る」
+
+*   **学習内容**:
+    *   `curl -i` / `curl -v` によるステータス行・ヘッダーの確認
+    *   `DEBUG=express:*` による Express 内部のルーティング判定ログ
+    *   `req` の主要プロパティの違い (`method`, `originalUrl`, `path`, `baseUrl`, `params`, `query`, `headers`)
+    *   `console.log` の限界と `console.dir` / `util.inspect`
+*   **コマンド/コード**:
+    ```bash
+    curl -i http://localhost:3000/
+    ```
+    ```bash
+    curl -v http://localhost:3000/
+    ```
+    `-v` の出力では `>` が自分の送ったリクエスト、`<` がサーバーの返したレスポンスです。
+
+    Express 自身に「どのルートへ照合したか」を喋らせる:
+    ```bash
+    DEBUG=express:router,express:application node index.js
+    ```
+    ```powershell
+    $env:DEBUG="express:router,express:application"; node index.js
+    ```
+    リクエストの中身を丸ごと覗くデバッグ用ミドルウェア:
+    ```javascript
+    app.use((req, res, next) => {
+      console.dir({
+        method: req.method,
+        originalUrl: req.originalUrl,   // マウント前のフルパス
+        baseUrl: req.baseUrl,           // Router のマウントパス
+        path: req.path,                 // クエリを除いたパス
+        query: req.query,
+        headers: req.headers,
+      }, { depth: null });
+      next();
+    });
+    ```
+*   ✅ **チェックポイント**:
+    *   `curl -v` の出力で送信ヘッダーと受信ヘッダーを読み分けられること。
+    *   `DEBUG=express:router` でルート照合のログが出力されること。
+*   🔰 **実務 Tips**: 障害報告を受けたら、まず `curl -i` で**再現するかどうか**を確認します。ブラウザ経由だとキャッシュ・Cookie・拡張機能・CORS が混ざるため、切り分けの一手目はブラウザを外した curl です。
+*   🔍 **デバッグ**: `console.log(obj)` はネストが深いオブジェクトを `[Object]` と省略します。全体を見たいときは `console.dir(obj, { depth: null })` または `util.inspect(obj, { depth: null, colors: true })` を使ってください。
+
+### Step 5: ルーティングの基礎
+
+*   **学習内容**:
+    *   GET / POST / PUT / DELETE メソッドの役割
+    *   RESTful な URL 設計
+    *   ルートパラメータ (`:id`) の使い方
+    *   **ルートは定義順に上から照合される**という原則
+    *   最後に置く 404 フォールバック
+*   **コマンド/コード**:
+    ```javascript
+    app.get('/memos', (req, res) => { /* 一覧取得 */ });
+    app.post('/memos', (req, res) => { /* 新規作成 */ });
+    app.get('/memos/:id', (req, res) => {
+      const id = req.params.id; // パラメータの取得
+      res.send(`Memo ID: ${id}`);
+    });
+
+    // すべてのルート定義の後に置く 404 フォールバック
+    app.use((req, res) => {
+      res.status(404).json({ error: 'Not Found', path: req.originalUrl });
+    });
+    ```
+*   ✅ **チェックポイント**: 各 HTTP メソッドに対して適切にレスポンスが返ってくること。存在しないパスで、Express 既定の HTML ではなく自作の JSON 404 が返ること。
+*   🔍 **デバッグ**: 「404 になる」ときの切り分け順序は次の通りです。
+    1.  **パスは合っているか** — 404 フォールバックに `req.originalUrl` を含めておけば、サーバーが実際に受け取ったパスが分かります。末尾スラッシュ・大文字小文字・`/api` プレフィックスの付け忘れがここで露見します。
+    2.  **メソッドは合っているか** — `GET /memos` を定義して `POST` を送っていないか。405 ではなく 404 になる点に注意。
+    3.  **定義順に負けていないか** — `/memos/:id` を `/memos/new` より先に定義すると、`/memos/new` は `:id = "new"` として先に食われます。
+    4.  **そもそも登録されているか** — 登録済みルートを一覧化して確認します。
+    ```javascript
+    // 登録済みルートのダンプ (Express 4 系)
+    app._router.stack
+      .filter((l) => l.route)
+      .forEach((l) => console.log(Object.keys(l.route.methods).join(',').toUpperCase(), l.route.path));
+    ```
+    `app._router` は内部 API のためバージョンで変わります。恒久的に使うなら `express-list-endpoints` パッケージを利用してください。
+
+### Step 6: リクエストデータの処理
+
+*   **学習内容**:
+    *   `express.json()` ミドルウェアによる JSON ボディのパース
+    *   `express.urlencoded({ extended: true })` によるフォームのパース
+    *   `req.body`, `req.params`, `req.query` の違い
+    *   `res.json()` による JSON レスポンス
+    *   `res.status()` によるステータスコード指定
+    *   `req.is()` / `req.get()` によるリクエスト内容の判定
+*   **コマンド/コード**:
+    ```javascript
+    // JSONを扱うためのミドルウェアを有効化
+    app.use(express.json());
+    app.use(express.urlencoded({ extended: true })); // HTML フォーム用
+
+    app.post('/memos', (req, res) => {
+      const { title, content } = req.body;
+      const newMemo = { id: 1, title, content };
+      res.status(201).json(newMemo);
+    });
+    ```
+    動作確認:
+    ```bash
+    curl -i -X POST http://localhost:3000/memos -H "Content-Type: application/json" -d "{\"title\":\"t\",\"content\":\"c\"}"
+    ```
+*   ✅ **チェックポイント**: POST リクエストで JSON を送信し、パースされたデータを含む JSON レスポンスがステータスコード 201 で返ってくること。
+*   🔍 **デバッグ**: **`req.body` が `undefined` / `{}` になる**のは入門で最も踏む罠です。原因は次のいずれかに収まります。
+
+    | 原因 | 確認方法 |
+    | :--- | :--- |
+    | `express.json()` を `app.use` していない | ミドルウェア登録行の有無 |
+    | `express.json()` の登録がルート定義**より後** | `app.use(express.json())` をルートより上に移す |
+    | リクエストの `Content-Type` が `application/json` でない | `console.log(req.get('content-type'), req.is('json'))` |
+    | 送った JSON が壊れている | パースエラーは 400 としてエラーハンドラに来る (`err.type === 'entity.parse.failed'`) |
+    | フォーム送信 (`application/x-www-form-urlencoded`) なのに `urlencoded()` 未登録 | 同上 |
+
+    ```javascript
+    app.use((req, res, next) => {
+      console.log('content-type:', req.get('content-type'), '| is json:', req.is('json'));
+      next();
+    });
+    ```
+
+### Step 7: レスポンスの組み立てとヘッダー操作
+
+*   **学習内容**:
+    *   `res.send` / `res.json` / `res.sendStatus` / `res.end` の使い分け
+    *   `res.set()` / `res.type()` / `res.location()` / `res.redirect()`
+    *   `res.headersSent` によるレスポンス送信済み判定
+    *   「1 リクエストにつきレスポンスは 1 回だけ」という鉄則
+*   **コマンド/コード**:
+    ```javascript
+    app.get('/download', (req, res) => {
+      res.set('X-Request-Handled-By', 'memo-api');
+      res.type('text/plain');
+      res.send('ok');
+    });
+
+    app.get('/old', (req, res) => res.redirect(301, '/memos'));
+
+    // 送信完了を必ず観測する
+    app.use((req, res, next) => {
+      res.on('finish', () => console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode}`));
+      next();
+    });
+    ```
+*   ✅ **チェックポイント**:
+    *   `curl -i` でレスポンスヘッダーに自前のヘッダーが載っていること。
+    *   `res.json()` を呼ぶと `Content-Type: application/json` が自動付与されることを確認できること。
+*   🔍 **デバッグ**: `ERR_HTTP_HEADERS_SENT` (`Cannot set headers after they are sent to the client`) は、**1 つのリクエストに 2 回レスポンスを返そうとした**ときに出ます。ほぼ例外なく `return` の書き忘れです。
+    ```javascript
+    if (!memo) {
+      return res.status(404).json({ error: 'not found' }); // ← この return を忘れると後続も実行される
+    }
+    res.json(memo);
+    ```
+    どこで二重送信しているか分からないときは、送信直前に `res.headersSent` を出力して当たりを付けます。
+
+### Step 8: メモ帳CRUDの完成
+
+*   **学習内容**:
+    *   インメモリの配列を使ったデータ保存
+    *   CRUD (Create, Read, Update, Delete) 全ての処理の実装
+    *   適切なステータスコード (200, 201, 404, 204) の使い分け
+*   **コマンド/コード**:
+    ```javascript
+    let memos = []; // インメモリデータストア
+
+    app.delete('/memos/:id', (req, res) => {
+      const id = parseInt(req.params.id);
+      const initialLength = memos.length;
+      memos = memos.filter(m => m.id !== id);
+
+      if (memos.length === initialLength) {
+        return res.status(404).json({ error: 'Memo not found' });
+      }
+      res.status(204).send();
+    });
+    ```
+*   ✅ **チェックポイント**: curl や REST Client で GET, POST, PUT, DELETE 全ての操作が正しく動作し、データが更新されること。
+*   🔰 **実務 Tips**: `req.params.id` は**常に文字列**です。数値 ID と `===` で比較すると必ず false になります。`parseInt` / `Number` で明示的に変換するか、比較前に型を揃えてください。
+*   🔍 **デバッグ**: 「DELETE したのに 404」「更新したのに古い値」の切り分けは、**ハンドラの入口で受け取った値と型を出す**のが最短です。
+    ```javascript
+    console.log('id:', req.params.id, typeof req.params.id, '| stored:', memos.map(m => m.id));
+    ```
+    なお 204 No Content ではボディを送れません。「204 を返したのにレスポンスが空」は仕様通りです。
+*   📚 **参考リンク**: Express ルーティング公式ドキュメント: https://expressjs.com/ja/guide/routing.html
+
+### Step 9: 落ちないサーバーにする第一歩
+
+*   **学習内容**:
+    *   同期エラーと非同期エラー (Promise rejection) の違い
+    *   `next(err)` によるエラーハンドラへの受け渡し
+    *   最小限のエラーハンドリングミドルウェア
+    *   `process.on('unhandledRejection')` / `uncaughtException` による最終防衛線
+    *   スタックトレースの読み方
+*   **コマンド/コード**:
+    ```javascript
+    app.get('/boom', async (req, res, next) => {
+      try {
+        throw new Error('意図的な失敗');
+      } catch (err) {
+        next(err); // Express 4 系では非同期エラーは自動転送されない
+      }
+    });
+
+    // すべてのルートの後ろに置く (引数 4 つで「エラーハンドラ」と認識される)
+    app.use((err, req, res, next) => {
+      console.error(err.stack);
+      res.status(err.status || 500).json({ error: err.message });
+    });
+
+    // 拾いきれなかったものを最後に記録する
+    process.on('unhandledRejection', (reason) => {
+      console.error('unhandledRejection:', reason);
+    });
+    process.on('uncaughtException', (err) => {
+      console.error('uncaughtException:', err);
+      process.exit(1); // 状態が壊れている可能性があるため落とすのが定石
+    });
+    ```
+*   ✅ **チェックポイント**:
+    *   `/boom` にアクセスしてもサーバープロセスが終了せず、JSON でエラーが返ること。
+    *   エラーハンドラの引数が **4 つ** でないと動かないことを理解していること。
+*   🔍 **デバッグ**: スタックトレースは上から「エラー発生地点 → 呼び出し元」の順です。`node_modules` の行は読み飛ばし、**最初に現れる自分のファイル名の行**を見てください。そこが起点です。行番号がビルド後のファイルとずれる場合は `--enable-source-maps` を付けます。
+    ```bash
+    node --enable-source-maps index.js
+    ```
+
+🚀 **次のレベルへ進む判断基準**:
+*   APIの仕様に基づいて、ゼロからCRUD機能を持つExpressサーバーを立ち上げることができる。
+*   404 / `req.body` が空 / 二重送信 の 3 大トラブルを、`curl -i` と `DEBUG` で切り分けられる。
+
+## 中級レベル (Intermediate) 📙
+
+所要時間: 2〜3週間
+目標: ミドルウェアの概念を深く理解し、データベースとの連携やエラー処理など、現実的なアプリケーションの挙動を実装できる。あわせてデバッガと SQL ログを使い、推測ではなく観測で原因を特定できる。
+プロジェクト: ユーザー認証付きブログ API
+
+### Step 1: ミドルウェアの理解と自作
+
+*   **学習内容**:
+    *   ミドルウェアの基本概念 (req, res, next)
+    *   `next()` 関数の役割
+    *   カスタムミドルウェアの作成と実行順序
+    *   `next()` を呼ばない = リクエストが宙吊りになる、という因果
+*   **コマンド/コード**:
+    ```javascript
+    const logger = (req, res, next) => {
+      const start = process.hrtime.bigint();
+      res.on('finish', () => {
+        const ms = Number(process.hrtime.bigint() - start) / 1e6;
+        console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${ms.toFixed(1)}ms`);
+      });
+      next(); // 次の処理へ渡す
+    };
+
+    app.use(logger); // アプリケーション全体に適用
+    ```
+*   ✅ **チェックポイント**: ターミナルに各リクエストのログがステータスコードと所要時間つきで出力されること。
+*   🔰 **実務 Tips**: `res.on('finish')` はレスポンス送信完了時、`res.on('close')` はクライアント切断時にも発火します。「処理は走ったがユーザーには届かなかった」を検知したいときは `close` 側を見ます。
+*   🔍 **デバッグ**: **レスポンスが返ってこない (ブラウザが回り続ける)** 場合、原因の大半は「`next()` も `res.*()` も呼ばれていないミドルウェアがある」ことです。上記の `finish` ログが出ていなければ、レスポンスは一度も送信されていません。どのミドルウェアで止まったかは、各ミドルウェアの先頭に通過ログを入れて最後に到達した位置を見るか、`node --inspect` でブレークポイントを張って確認します。
+
+### Step 2: サードパーティミドルウェアの導入
+
+*   **学習内容**:
+    *   `cors` (クロスオリジン設定)
+    *   `helmet` (セキュリティヘッダー設定)
+    *   `morgan` (ロギング)
+    *   各ミドルウェアが**どのレスポンスヘッダーを足しているか**を自分の目で確認する
+*   **コマンド/コード**:
+    ```bash
+    npm install cors helmet morgan
+    ```
+    ```javascript
+    import cors from 'cors';
+    import helmet from 'helmet';
+    import morgan from 'morgan';
+
+    app.use(helmet());
+    app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
+    app.use(morgan('dev'));
+    ```
+*   ✅ **チェックポイント**: HTTPレスポンスヘッダーにセキュリティ関連のヘッダーが追加され、ターミナルに見やすいアクセスログが出力されること。
+*   🔍 **デバッグ**: **CORS エラー**はブラウザ側のメッセージだけでは原因が分かりません。プリフライト (OPTIONS) を直接叩き、返ってきたヘッダーを確認します。
+    ```bash
+    curl -i -X OPTIONS http://localhost:3000/api/posts -H "Origin: http://localhost:5173" -H "Access-Control-Request-Method: POST" -H "Access-Control-Request-Headers: content-type"
+    ```
+    見るべき点:
+    *   `Access-Control-Allow-Origin` が要求 Origin と一致しているか (`credentials: true` のとき `*` は使えません)
+    *   `Access-Control-Allow-Headers` に送信予定のヘッダー (`Authorization` など) が含まれているか
+    *   ステータスが 204 または 200 で返っているか
+
+    また **フロント画面が真っ白 / 外部スクリプトが読めない**場合は `helmet()` の CSP (`Content-Security-Policy`) が効いています。切り分けとして一時的に `helmet({ contentSecurityPolicy: false })` で再現するかを見ます (本番では必ず戻し、必要なディレクティブだけ許可します)。
+
+### Step 3: express.Router によるルート分割
+
+*   **学習内容**:
+    *   `express.Router()` による機能ごとのルート管理
+    *   `router.use()` による特定パスへのミドルウェア適用
+    *   別ファイルへのルーティングの切り出し
+    *   マウントパスと `req.baseUrl` / `req.originalUrl` の関係
+    *   `router.param()` による共通の ID 解決
+*   **コマンド/コード**:
+    `routes/posts.js`:
+    ```javascript
+    import { Router } from 'express';
+    const router = Router();
+
+    // :id を含むルートに入る前に必ず走る
+    router.param('id', (req, res, next, id) => {
+      req.postId = Number(id);
+      if (Number.isNaN(req.postId)) return res.status(400).json({ error: 'invalid id' });
+      next();
+    });
+
+    router.get('/', (req, res) => { /* 記事一覧 */ });
+    router.get('/:id', (req, res) => res.json({ id: req.postId }));
+    export default router;
+    ```
+    `index.js`:
+    ```javascript
+    import postRoutes from './routes/posts.js';
+    app.use('/api/posts', postRoutes);
+    ```
+*   ✅ **チェックポイント**: `/api/posts` のエンドポイントが別ファイルで定義され、正常に機能すること。
+*   🔰 **実務 Tips**: 実務では機能 (users, posts等) やバージョン (v1, v2) ごとに Router を分割して保守性を高めます。
+*   🔍 **デバッグ**: Router 分割後に 404 が出たら、**マウントパスとルート内パスの二重定義**を疑います。`app.use('/api/posts', router)` の中で `router.get('/api/posts', ...)` と書くと、実パスは `/api/posts/api/posts` になります。
+    ```javascript
+    console.log({ baseUrl: req.baseUrl, path: req.path, originalUrl: req.originalUrl });
+    ```
+    また、404 フォールバックとエラーハンドラは**すべての `app.use(router)` の後**に置きます。先に置くと全リクエストが 404 に吸い込まれます。
+
+### Step 4: Node.js デバッガで止めて見る
+
+*   **学習内容**:
+    *   `node --inspect` / `--inspect-brk` とインスペクタの接続
+    *   VS Code の `launch.json` / プロセスへのアタッチ
+    *   ブレークポイント・ステップ実行・ウォッチ式・コールスタック
+    *   `debugger` 文
+    *   `console.table` / `console.time` / `console.trace` / `console.dir`
+*   **コマンド/コード**:
+    ```bash
+    node --inspect --watch index.js
+    ```
+    ```bash
+    node --inspect-brk index.js
+    ```
+    `--inspect-brk` は 1 行目で停止して接続を待つため、起動直後に落ちる不具合の調査に向きます。
+
+    `.vscode/launch.json`:
+    ```json
+    {
+      "version": "0.2.0",
+      "configurations": [
+        {
+          "type": "node",
+          "request": "launch",
+          "name": "Debug API",
+          "program": "${workspaceFolder}/index.js",
+          "envFile": "${workspaceFolder}/.env",
+          "skipFiles": ["<node_internals>/**"]
+        }
+      ]
+    }
+    ```
+    ログ側の補助 API:
+    ```javascript
+    console.table(memos);                                 // 配列を表形式で
+    console.time('db'); /* ... */ console.timeEnd('db');  // 所要時間
+    console.trace('ここに来た');                            // 呼び出し元のスタック
+    console.dir(err, { depth: null });                    // ネストを省略せず表示
+    ```
+*   ✅ **チェックポイント**:
+    *   ハンドラ内にブレークポイントを張り、`req.body` の中身を実行中に確認できること。
+    *   `console.trace()` で「この関数が誰から呼ばれたか」を追えること。
+*   🔰 **実務 Tips**: 「どこで例外が出ているか分からない」ときは、デバッガの **例外で停止 (Break on exceptions)** を有効にすると、例外発生の瞬間にその場の変数ごと止められます。ログを仕込んで再起動する往復より圧倒的に速いです。
+*   🔍 **デバッグ**: `--inspect` は既定で `127.0.0.1:9229` を listen します。Docker コンテナ内のプロセスに繋ぐ場合は `--inspect=0.0.0.0:9229` とし、ポートを公開してください。
+
+### Step 5: データベース連携
+
+*   **学習内容**:
+    *   Prisma ORM の基礎
+    *   SQLite を用いたローカル開発
+    *   スキーマ定義とマイグレーション
+    *   **発行される SQL を見る** (`log` オプション)
+    *   Prisma のエラーコード (`P2002` 一意制約違反 / `P2025` レコード無し など)
+*   **コマンド/コード**:
+    ```bash
+    npm install prisma --save-dev
+    npm install @prisma/client
+    npx prisma init --datasource-provider sqlite
+    ```
+    `prisma/schema.prisma` にモデルを定義後:
+    ```bash
+    npx prisma migrate dev --name init
+    ```
+    ```javascript
+    import { PrismaClient } from '@prisma/client';
+
+    const prisma = new PrismaClient({
+      log: [{ emit: 'event', level: 'query' }, 'warn', 'error'],
+    });
+
+    prisma.$on('query', (e) => {
+      console.log(`[SQL ${e.duration}ms] ${e.query} -- ${e.params}`);
+    });
+
+    app.get('/users', async (req, res) => {
+      const users = await prisma.user.findMany();
+      res.json(users);
+    });
+    ```
+*   ✅ **チェックポイント**: Prisma Client を使って DB からデータを取得・作成するエンドポイントが動作し、実行された SQL と所要時間がログに出ること。
+*   🔰 **実務 Tips**: DB の中身を直接見る手段を必ず持ってください。`npx prisma studio` でブラウザから閲覧・編集できます。「API が悪いのかデータが悪いのか」はここで分かれます。
+*   🔍 **デバッグ**: 一覧取得のたびに SQL が N 本流れていれば **N+1 問題**です。`include` / `select` で 1 本にまとめます。
+    ```javascript
+    const posts = await prisma.post.findMany({ include: { author: true } });
+    ```
+    書き込み失敗は例外の `code` を見ると原因が一意に決まります。
+    ```javascript
+    try {
+      await prisma.user.create({ data });
+    } catch (e) {
+      console.error(e.code, e.meta); // 例: P2002 { target: ['email'] } → email が重複
+      throw e;
+    }
+    ```
+
+### Step 6: グローバルエラーハンドリング
+
+*   **学習内容**:
+    *   エラーハンドリングミドルウェア (引数が4つ `err, req, res, next`)
+    *   非同期関数のエラーキャッチ (`express-async-errors` パッケージの利用)
+    *   カスタムエラークラスの作成
+    *   `err.cause` による原因の連鎖
+    *   本番と開発でレスポンスの詳細度を切り替える
+*   **コマンド/コード**:
+    ```bash
+    npm install express-async-errors
+    ```
+    ```javascript
+    import 'express-async-errors'; // 一番上でインポート
+
+    export class AppError extends Error {
+      constructor(message, status = 400, options) {
+        super(message, options); // options.cause で元の例外を保持できる
+        this.name = 'AppError';
+        this.status = status;
+      }
+    }
+    // throw new AppError('ユーザー作成に失敗しました', 500, { cause: prismaError });
+
+    // カスタムエラーハンドラ (他のすべての app.use の後に配置)
+    app.use((err, req, res, next) => {
+      console.error(err.stack);
+      if (err.cause) console.error('caused by:', err.cause);
+
+      const status = err.status || 500;
+      const body = { error: err.message || 'Internal Server Error' };
+      if (process.env.NODE_ENV !== 'production') body.stack = err.stack; // 本番では返さない
+      res.status(status).json(body);
+    });
+    ```
+*   ✅ **チェックポイント**: ルート内で意図的に `throw new Error()` を発生させ、サーバーがクラッシュせず JSON でエラーが返ること。
+*   🔍 **デバッグ**: **エラーハンドラが呼ばれない**ときの原因は 3 つに絞られます。
+    1.  引数が 4 つになっていない (`next` を省くとただのミドルウェアとして扱われる)
+    2.  ルート定義より**前**に登録している
+    3.  非同期関数内の例外を `next(err)` に渡していない (Express 4 系。`express-async-errors` を入れるか `try/catch` する)
+
+    受け取ったエラーの正体が分からないときは、素の `console.log(err)` ではカスタムプロパティが省略されることがあります。
+    ```javascript
+    console.dir(err, { depth: null });
+    console.log(err.constructor.name, err.code, err.status);
+    ```
+
+### Step 7: 環境変数と設定管理
+
+*   **学習内容**:
+    *   Node.js v21+ の `--env-file` または `dotenv` パッケージ
+    *   `.env` ファイルと `.env.example` の運用
+    *   Git 管理から除外 (`.gitignore`)
+    *   **起動時に設定を検証して落とす** (fail fast)
+*   **コマンド/コード**:
+    `.env` ファイルを作成:
+    ```
+    PORT=8080
+    DATABASE_URL="file:./dev.db"
+    JWT_SECRET="supersecretkey"
+    ```
+    起動時のコマンド (`package.json`):
+    ```json
+    "dev": "node --watch --env-file=.env index.js"
+    ```
+    `config.js` — 起動時に検証する:
+    ```javascript
+    import { z } from 'zod';
+
+    const schema = z.object({
+      PORT: z.coerce.number().default(3000),
+      DATABASE_URL: z.string().min(1),
+      JWT_SECRET: z.string().min(16),
+      NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    });
+
+    const parsed = schema.safeParse(process.env);
+    if (!parsed.success) {
+      console.error('環境変数が不正です:', parsed.error.flatten().fieldErrors);
+      process.exit(1);
+    }
+    export const config = parsed.data;
+    ```
+*   ✅ **チェックポイント**: コード内で環境変数を読み取れること。`.env` から 1 行消すと、リクエスト時ではなく**起動時**にエラーで止まること。
+*   🔍 **デバッグ**: 「ローカルでは動くのに別環境で落ちる」の大半は環境変数です。値そのものを出力せず、**キーの有無と長さだけ**を確認するのが安全な手口です。
+    ```javascript
+    console.log('JWT_SECRET length:', process.env.JWT_SECRET?.length ?? 'undefined');
+    ```
+
+### Step 8: 認証・認可
+
+*   **学習内容**:
+    *   `bcrypt` によるパスワードのハッシュ化
+    *   `jsonwebtoken` (JWT) を用いたステートレス認証
+    *   トークンを検証する認証ミドルウェアの実装
+    *   JWT の中身を見る手段と、失敗理由の見分け方
+*   **コマンド/コード**:
+    ```bash
+    npm install bcrypt jsonwebtoken
+    ```
+    ```javascript
+    import jwt from 'jsonwebtoken';
+
+    const authMiddleware = (req, res, next) => {
+      const token = req.headers.authorization?.split(' ')[1];
+      if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
+        next();
+      } catch (err) {
+        // err.name で失敗理由が分かる
+        res.status(403).json({ error: 'Invalid token', reason: err.name });
+      }
+    };
+    ```
+*   ✅ **チェックポイント**: 保護されたエンドポイントに有効な JWT トークンを Authorization ヘッダーに付与してアクセスできること。
+*   🔍 **デバッグ**: 401 / 403 の切り分けは、**署名検証をせずに中身だけ見る**と一気に進みます。
+    ```javascript
+    // 検証せずにペイロードとヘッダーを覗く (デバッグ専用。認可判断に使ってはいけない)
+    console.dir(jwt.decode(token, { complete: true }), { depth: null });
+    ```
+
+    | `err.name` / メッセージ | 意味 | 典型的な原因 |
+    | :--- | :--- | :--- |
+    | `TokenExpiredError` | 有効期限切れ | `exp` 超過。サーバー間の時刻ずれでも起きる |
+    | `invalid signature` | 署名不一致 | 発行時と検証時の `JWT_SECRET` が違う (環境変数の読み込み漏れ) |
+    | `jwt malformed` | 形式不正 | `Bearer ` の除去漏れ、トークンが空文字や `undefined` |
+
+    ヘッダーが本当に届いているかは、生の値を見るのが確実です。
+    ```javascript
+    console.log('authorization:', JSON.stringify(req.headers.authorization));
+    ```
+*   📚 **参考リンク**: Prisma 公式ドキュメント: https://www.prisma.io/docs
+
+### Step 9: ネットワーク層まで降りて切り分ける
+
+*   **学習内容**:
+    *   `NODE_DEBUG=http,net` による Node コアの通信ログ
+    *   `curl -w` によるフェーズ別のタイミング計測
+    *   サーバー側のタイムアウト設定 (`keepAliveTimeout` / `headersTimeout` / `requestTimeout`)
+    *   「クライアントが悪いのかサーバーが悪いのか」の切り分け
+*   **コマンド/コード**:
+    ```bash
+    NODE_DEBUG=http,net node index.js
+    ```
+    ```powershell
+    $env:NODE_DEBUG="http,net"; node index.js
+    ```
+    段階ごとの所要時間を測る:
+    ```bash
+    curl -o /dev/null -s -w "dns:%{time_namelookup} connect:%{time_connect} ttfb:%{time_starttransfer} total:%{time_total}\n" http://localhost:3000/memos
+    ```
+    サーバー側のタイムアウト:
+    ```javascript
+    const server = app.listen(port);
+    server.keepAliveTimeout = 65_000; // ロードバランサの idle timeout より長くする
+    server.headersTimeout   = 66_000; // keepAliveTimeout より長くする
+    server.requestTimeout   = 30_000; // 1 リクエストの上限
+    ```
+*   ✅ **チェックポイント**:
+    *   `time_starttransfer` (TTFB) と `time_total` の差から、遅いのが「処理」なのか「転送」なのかを判断できること。
+    *   タイムアウト値の大小関係に意味があることを理解していること。
+*   🔰 **実務 Tips**: ロードバランサ配下で 502 が散発するときの定番原因が `keepAliveTimeout` の設定漏れです。LB 側の idle timeout より**サーバー側を長く**しておかないと、LB が再利用しようとした接続をサーバーが先に閉じてしまいます。
+*   🔍 **デバッグ**: この Step はクライアント側ロードマップ ([Undici-Master](../Undici-Master/Roadmap.md) 中級 Step 5・実務 Step 1) と対になっています。**Express で作った API を Undici から叩き、両側のログを突き合わせる**と、タイムアウトとコネクション再利用の挙動が一度に理解できます。
+
+🚀 **次のレベルへ進む判断基準**:
+*   ORMを使ったDB操作、エラーハンドリング、JWT認証を含む現実的なAPI仕様を実装できる。
+*   不具合に対して「ログを増やす」以外に、デバッガ・SQL ログ・curl のタイミング計測という選択肢を持てている。
+
+## 実務レベル (Advanced) 📕
+
+所要時間: 3〜4週間
+目標: 保守性が高く、テストが容易で、セキュリティが考慮された本番運用に耐えうるアーキテクチャを構築できる。障害時に手順化された切り分けができる。
+プロジェクト: 堅牢なタスク管理システム
+
+### Step 1: 実務的なディレクトリ構成
+
+*   **学習内容**:
+    *   Routes → Controllers → Services → Repositories のレイヤー分離
+    *   依存性逆転 (DI) の考え方
+    *   クリーンアーキテクチャへの橋渡し
+    *   `app` と `server` の分離 (テスト容易性のため)
+*   **コマンド/コード**:
+    ```text
+    src/
+      app.js       # express インスタンスを組み立てて export (listen しない)
+      server.js    # app を import して listen するだけ
+      routes/      # エンドポイント定義
+      controllers/ # HTTPリクエスト/レスポンスの処理
+      services/    # ビジネスロジック
+      repositories/# データベース操作
+    ```
+    `controller.js`:
+    ```javascript
+    import { getTasksService } from '../services/taskService.js';
+
+    export const getTasks = async (req, res) => {
+      const tasks = await getTasksService();
+      res.json(tasks);
+    };
+    ```
+*   ✅ **チェックポイント**: 処理が適切なレイヤーに分割され、Controller 内に複雑なビジネスロジックやDBクエリが存在しないこと。`app.js` が `listen` を含まないこと。
+*   🔍 **デバッグ**: レイヤーを分けておくと「どの層で壊れたか」を層ごとに切り分けられます。障害時は **Service 層を直接呼ぶ小さなスクリプト**を実行してみてください。そこで再現すれば HTTP 層は無関係だと即断できます。
+    ```bash
+    node -e "import('./src/services/taskService.js').then(m => m.getTasksService()).then(console.log).catch(console.error)"
+    ```
+
+### Step 2: 入力バリデーション
+
+*   **学習内容**:
+    *   `Zod` によるスキーマ定義と型安全なバリデーション
+    *   汎用的なバリデーションミドルウェアの実装
+    *   `parse` と `safeParse` の使い分け
+    *   `error.flatten()` / `error.issues` によるエラー内容の読み方
+*   **コマンド/コード**:
+    ```bash
+    npm install zod
+    ```
+    ```javascript
+    import { z } from 'zod';
+
+    const taskSchema = z.object({
+      title: z.string().min(1).max(100),
+      completed: z.boolean().optional()
+    });
+
+    const validate = (schema) => (req, res, next) => {
+      const result = schema.safeParse(req.body);
+      if (!result.success) {
+        // fieldErrors: { title: ['String must contain at least 1 character(s)'] }
+        return res.status(400).json({ errors: result.error.flatten().fieldErrors });
+      }
+      req.body = result.data; // 変換・既定値適用後の値で上書き
+      next();
+    };
+
+    app.post('/tasks', validate(taskSchema), taskController.createTask);
+    ```
+*   ✅ **チェックポイント**: 不正なデータを POST した際に、Zod の詳細なエラーメッセージが 400 ステータスで返ること。
+*   🔍 **デバッグ**: バリデーションが**通るはずなのに落ちる**ときは、スキーマではなく入力そのものを疑い、パース直前の値と型を出力します。
+    ```javascript
+    console.dir(Object.fromEntries(Object.entries(req.body ?? {}).map(([k, v]) => [k, `${typeof v}: ${v}`])), { depth: null });
+    ```
+    最頻出は「クエリ文字列は常に string」です。`?completed=true` は文字列 `"true"` であり `z.boolean()` には通りません。`z.coerce.boolean()` や `z.enum(['true','false'])` を使います。
+
+### Step 3: セキュリティ強化
+
+*   **学習内容**:
+    *   `helmet` の詳細設定 (CSPなど)
+    *   `express-rate-limit` によるブルートフォース/DDoS対策
+    *   本番環境向け CORS 設定
+    *   `trust proxy` とクライアント IP の正しい取得
+*   **コマンド/コード**:
+    ```bash
+    npm install express-rate-limit
+    ```
+    ```javascript
+    import rateLimit from 'express-rate-limit';
+
+    // リバースプロキシ/LB 配下では必須。これが無いと全員が同じ IP に見える
+    app.set('trust proxy', 1);
+
+    const limiter = rateLimit({
+      windowMs: 15 * 60 * 1000, // 15分
+      max: 100, // IPごとに15分間で100リクエストまで
+      standardHeaders: true,    // RateLimit-* ヘッダーを返す (残量がクライアントから見える)
+      message: 'Too many requests, please try again later.'
+    });
+
+    app.use('/api/', limiter);
+    ```
+*   ✅ **チェックポイント**: 短時間に大量のリクエストを送った際に 429 Too Many Requests が返ること。
+*   🔰 **実務 Tips**: 実務では Redis などを用いて分散環境でもレート制限が機能するように構成します。
+*   🔍 **デバッグ**: 「レート制限が全ユーザーに一括でかかる / まったくかからない」場合は、キーになっている IP を出力して確認します。
+    ```javascript
+    app.use((req, res, next) => {
+      console.log({ ip: req.ip, xff: req.get('x-forwarded-for'), protocol: req.protocol, secure: req.secure });
+      next();
+    });
+    ```
+    `trust proxy` が未設定だと `req.ip` は常にプロキシの IP になり、全員が同一キーに集約されます。逆に無条件で信頼すると `X-Forwarded-For` を偽装されて制限を回避されます。**信頼するホップ数を数値で指定**してください。
+
+### Step 4: テスト戦略
+
+*   **学習内容**:
+    *   `Jest` と `Supertest` の環境構築
+    *   Service 層のユニットテスト (モックの活用)
+    *   API エンドポイントの統合テスト
+    *   テストが終わらない / CI だけ落ちる問題の潰し方
+*   **コマンド/コード**:
+    ```bash
+    npm install --save-dev jest supertest
+    ```
+    `tasks.test.js`:
+    ```javascript
+    import request from 'supertest';
+    import app from '../src/app.js'; // app.listenを含まないエクスポートされたapp
+
+    describe('GET /api/tasks', () => {
+      it('should return 200 and an array', async () => {
+        const res = await request(app).get('/api/tasks');
+        // 失敗したときに中身が見えるようにしておく
+        if (res.statusCode !== 200) console.log(res.statusCode, res.headers, res.text);
+        expect(res.statusCode).toBe(200);
+        expect(Array.isArray(res.body)).toBeTruthy();
+      });
+    });
+    ```
+*   ✅ **チェックポイント**: `npm test` コマンドでテストが実行され、成功すること。
+*   🔍 **デバッグ**: テスト特有の詰まりどころと対処:
+
+    | 症状 | 原因 | 対処 |
+    | :--- | :--- | :--- |
+    | テストが終了しない | DB 接続や `listen` が閉じていない | `jest --detectOpenHandles`、`afterAll` で `prisma.$disconnect()` |
+    | `res.body` が空 `{}` | レスポンスが JSON でない | `res.text` と `res.headers['content-type']` を出力 |
+    | ローカルは通るが CI で落ちる | 環境変数・タイムゾーン・実行順依存 | CI と同じ env で `jest --runInBand`、`process.env.TZ` を固定 |
+    | ポート競合 | テストが `listen` している | `app` と `server` を分離し、テストは `app` を渡す |
+
+    ```bash
+    npx jest --detectOpenHandles --runInBand
+    ```
+    テスト中のデバッガ接続も可能です。
+    ```bash
+    node --inspect-brk node_modules/jest/bin/jest.js --runInBand
+    ```
+
+### Step 5: 構造化ロギングと追跡
+
+*   **学習内容**:
+    *   `pino` を用いた高速な JSON ロギング
+    *   リクエスト ID (Correlation ID) の付与による追跡
+    *   `AsyncLocalStorage` による、引数を引き回さない文脈伝播
+    *   `redact` による機密情報のマスキング
+*   **コマンド/コード**:
+    ```bash
+    npm install pino pino-http
+    npm install --save-dev pino-pretty
+    ```
+    ```javascript
+    import pinoHttp from 'pino-http';
+    import crypto from 'crypto';
+
+    app.use(pinoHttp({
+      genReqId: (req) => req.headers['x-request-id'] || crypto.randomUUID(),
+      redact: ['req.headers.authorization', 'req.headers.cookie', 'req.body.password'],
+      level: process.env.LOG_LEVEL || 'info',
+    }));
+
+    // ハンドラ内ではリクエストに紐づいたロガーを使う (reqId が自動で載る)
+    app.get('/tasks', (req, res) => {
+      req.log.info({ userId: req.user?.id }, 'fetching tasks');
+      res.json([]);
+    });
+    ```
+    Service 層まで reqId を引き回したくない場合:
+    ```javascript
+    import { AsyncLocalStorage } from 'node:async_hooks';
+    export const als = new AsyncLocalStorage();
+
+    app.use((req, res, next) => als.run({ reqId: req.id }, next));
+
+    // どの階層からでも取り出せる
+    export const currentReqId = () => als.getStore()?.reqId;
+    ```
+*   ✅ **チェックポイント**: ログが JSON 形式で出力され、各リクエストごとに一意の ID が付与されていること。ローカルでは `pino-pretty` を使って整形表示できること。
+*   🔰 **実務 Tips**: `redact` は必ず入れてください。`Authorization` ヘッダーやパスワードがログに残ると、それ自体がインシデントになります。
+*   🔍 **デバッグ**: 障害調査は「時刻」ではなく「reqId」で追います。エラーレスポンスにも reqId を含めておくと、ユーザー報告からログへ一発で辿れます。
+    ```javascript
+    app.use((err, req, res, next) => {
+      req.log.error({ err }, 'unhandled');
+      res.status(err.status || 500).json({ error: err.message, requestId: req.id });
+    });
+    ```
+    ```bash
+    node src/server.js | npx pino-pretty
+    ```
+
+### Step 6: 計測とプロファイリング
+
+*   **学習内容**:
+    *   `autocannon` による負荷テスト
+    *   `--cpu-prof` / `--heap-prof` によるプロファイル取得と Chrome DevTools での読み方
+    *   `process.memoryUsage()` によるメモリ推移の観測
+    *   `perf_hooks.monitorEventLoopDelay` によるイベントループ遅延の検知
+*   **コマンド/コード**:
+    ```bash
+    npx autocannon -c 50 -d 10 http://localhost:3000/api/tasks
+    ```
+    ```bash
+    node --cpu-prof --cpu-prof-dir=./prof src/server.js
+    ```
+    停止すると `./prof/*.cpuprofile` が出力されます。Chrome DevTools のパフォーマンス系パネルから読み込めます。
+    ```javascript
+    import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+    const h = monitorEventLoopDelay({ resolution: 20 });
+    h.enable();
+    setInterval(() => {
+      console.log({
+        eventLoopDelayP99Ms: Math.round(h.percentile(99) / 1e6),
+        rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+        heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      });
+      h.reset();
+    }, 10_000).unref();
+    ```
+*   ✅ **チェックポイント**:
+    *   負荷をかけた状態で p99 レイテンシとスループットを数値で言えること。
+    *   イベントループ遅延が跳ねるタイミングと、重い同期処理の場所を対応づけられること。
+*   🔰 **実務 Tips**: 「遅い」と感じたら**まず測る**。推測で最適化すると、ボトルネックでない箇所を直して時間を失います。順序は (1) 負荷をかけて再現 → (2) プロファイル取得 → (3) 上位の関数だけ手を入れる、です。
+*   🔍 **デバッグ**: 症状別の一次切り分け。
+
+    | 症状 | 疑う対象 | 見る指標 |
+    | :--- | :--- | :--- |
+    | 全体的にレスポンスが遅い | 同期処理でイベントループを塞いでいる | `monitorEventLoopDelay` の p99 |
+    | 特定 API だけ遅い | DB クエリ / 外部 API | Prisma の query ログ、外部呼び出しの計測 |
+    | 時間とともに悪化・OOM | メモリリーク | `heapUsed` の右肩上がり、`--heap-prof` |
+    | 同時接続が増えると詰まる | コネクション数・プール枯渇 | DB プールサイズ、外部 HTTP クライアントの設定 |
+
+### Step 7: 本番で詰まったときの手順化
+
+*   **学習内容**:
+    *   グレースフルシャットダウン (`SIGTERM` → `server.close()`)
+    *   ヘルスチェックエンドポイント (`/healthz`, `/readyz`) の役割の違い
+    *   障害発生時の切り分け順序を手順として固定する
+    *   デプロイ後に見るべきシグナル
+*   **コマンド/コード**:
+    ```javascript
+    const server = app.listen(config.PORT);
+
+    const shutdown = async (signal) => {
+      console.log(`${signal} received. draining...`);
+      server.close(async () => {          // 新規接続を止め、処理中のリクエストを待つ
+        await prisma.$disconnect();
+        process.exit(0);
+      });
+      setTimeout(() => process.exit(1), 15_000).unref(); // 待っても終わらない場合の強制終了
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+
+    // 依存先まで見に行かない生存確認
+    app.get('/healthz', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+    // 依存先込みの受付可否
+    app.get('/readyz', async (req, res) => {
+      try {
+        await prisma.$queryRaw`SELECT 1`;
+        res.json({ ok: true });
+      } catch (e) {
+        res.status(503).json({ ok: false, error: e.message });
+      }
+    });
+    ```
+*   ✅ **チェックポイント**:
+    *   `SIGTERM` 送出時に処理中のリクエストが中断されず完了すること。
+    *   `/healthz` と `/readyz` の役割の違いを説明できること。
+*   🔍 **デバッグ**: 本番障害の切り分けは、**環境 → データ → コード**の順に潰します。コード (3番目) から疑い始めると、たいてい外します。
+    1.  **環境・権限**: 環境変数、DB への到達性、証明書、ディスク、デプロイされたリビジョン
+    2.  **データ**: 特定のレコードでのみ再現しないか (reqId からユーザー・入力値を特定)
+    3.  **コード**: ここまで来て初めてロジックを疑う
+
+    「直近のデプロイで壊れた」かどうかは、リビジョンと発生時刻の一致で判断します。レスポンスヘッダーにビルド情報を載せておくと即断できます。
+    ```javascript
+    app.use((req, res, next) => {
+      res.set('X-App-Revision', process.env.GIT_SHA || 'dev');
+      next();
+    });
+    ```
+
+### Step 8: Docker化
+
+*   **学習内容**:
+    *   Node.js 用 Dockerfile の作成 (マルチステージビルド)
+    *   `docker-compose.yml` による DB コンテナとの連動
+    *   本番ビルドにおける不要ファイルの除外 (`.dockerignore`)
+    *   コンテナの中を覗く手段
+*   **コマンド/コード**:
+    `Dockerfile`:
+    ```dockerfile
+    FROM node:22-alpine AS builder
+    WORKDIR /app
+    COPY package*.json ./
+    RUN npm ci
+    COPY . .
+    # ... build steps if any ...
+
+    FROM node:22-alpine
+    WORKDIR /app
+    COPY --from=builder /app/node_modules ./node_modules
+    COPY --from=builder /app/src ./src
+    EXPOSE 3000
+    CMD ["node", "src/index.js"]
+    ```
+*   ✅ **チェックポイント**: `docker compose up` でデータベースと Express アプリが起動し、ホスト側からアクセスできること。
+*   🔍 **デバッグ**: コンテナ特有の詰まりどころ。
+
+    | 症状 | 原因 | 対処 |
+    | :--- | :--- | :--- |
+    | ホストから繋がらない | `127.0.0.1` に listen している | `0.0.0.0` に listen し、`-p 3000:3000` を確認 |
+    | DB に繋がらない | `localhost` を指している | compose のサービス名 (例 `db`) をホスト名に使う |
+    | ローカルでは動くのにコンテナで落ちる | `.dockerignore` や COPY 漏れ | `docker exec -it <id> ls -la /app` で中身を確認 |
+
+    ```bash
+    docker compose logs -f api
+    ```
+    ```bash
+    docker exec -it <container> sh
+    ```
+    コンテナ内プロセスにデバッガを繋ぐ場合は `node --inspect=0.0.0.0:9229` にして `9229` を公開します。
+
+### Step 9: CI/CD と品質管理
+
+*   **学習内容**:
+    *   ESLint + Prettier によるコードフォーマット
+    *   Husky + lint-staged によるコミット前チェック
+    *   GitHub Actions による自動テスト実行
+    *   CI でだけ失敗する事象の原因分類
+*   **コマンド/コード**:
+    `.github/workflows/test.yml`:
+    ```yaml
+    name: Node.js CI
+    on: [push, pull_request]
+    jobs:
+      build:
+        runs-on: ubuntu-latest
+        steps:
+        - uses: actions/checkout@v4
+        - name: Use Node.js
+          uses: actions/setup-node@v4
+          with:
+            node-version: '22.x'
+        - run: npm ci
+        - run: npm test
+    ```
+*   ✅ **チェックポイント**: GitHub にプッシュした際、Actions 上でテストが自動実行されステータスが表示されること。
+*   🔍 **デバッグ**: **ローカルで通り CI で落ちる**ときの典型原因。
+
+    | 原因 | 確認 |
+    | :--- | :--- |
+    | 依存のバージョン差 | ローカルも `npm ci` (lockfile 厳守) で再現するか |
+    | ファイル名の大文字小文字 | Windows は区別しないが Linux は区別する (`./User.js` と `./user.js`) |
+    | 環境変数の未設定 | CI 側の secrets / env の定義 |
+    | タイムゾーン | `TZ=UTC npm test` で再現するか |
+    | 実行順・並列依存 | `--runInBand` で再現するか |
+
+    失敗時のログ・カバレッジを `actions/upload-artifact` で持ち帰ると、再現を待たずに解析できます。
+
+## 🧰 詰まったときの逆引き表
+
+| 症状 | まず疑う | 使う API / コマンド |
+| :--- | :--- | :--- |
+| 起動しない (`EADDRINUSE`) | 前回のプロセスが残存 | `Get-NetTCPConnection -LocalPort 3000`、`server.on('error')` |
+| 起動ログは出るが繋がらない | listen アドレス / ファイアウォール | `app.listen(port, '0.0.0.0')`、`curl -v` |
+| 404 が返る | パス・メソッド・定義順 | 404 フォールバックで `req.originalUrl`、`DEBUG=express:router`、ルート一覧ダンプ |
+| `req.body` が空 | `express.json()` 未登録 / Content-Type | `req.is('json')`、`req.get('content-type')`、`curl -H` |
+| レスポンスが返らない | `next()` / `res.*()` の呼び忘れ | `res.on('finish')` ログ、`node --inspect` |
+| `Cannot set headers after...` | 二重送信 (`return` 忘れ) | `res.headersSent` |
+| CORS で弾かれる | Origin / プリフライト / credentials | `curl -X OPTIONS -i`、`cors` の設定確認 |
+| 500 だが原因不明 | エラーが握り潰されている | `console.dir(err,{depth:null})`、`err.cause`、`--enable-source-maps` |
+| 401 / 403 | トークンの期限・署名鍵・形式 | `jwt.decode(token,{complete:true})`、`err.name` |
+| DB 更新が反映されない | クエリ条件 / 型不一致 | Prisma `log:['query']`、`npx prisma studio`、`e.code` |
+| 特定 API だけ遅い | N+1 / 外部 API | SQL ログの本数、`console.time` |
+| 全体が遅い | イベントループ阻塞 | `monitorEventLoopDelay`、`--cpu-prof`、`autocannon` |
+| 時間経過で OOM | メモリリーク | `process.memoryUsage()`、`--heap-prof` |
+| テストが終了しない | ハンドル未クローズ | `jest --detectOpenHandles`、`afterAll` で切断 |
+| CI だけ落ちる | env / 大文字小文字 / TZ / 実行順 | `npm ci`、`TZ=UTC`、`--runInBand` |
+| コンテナから繋がらない | listen アドレス / ホスト名 | `0.0.0.0`、compose のサービス名、`docker compose logs -f` |
+
+## 🔧 デバッグ API / コマンド チートシート
+
+### Express / Node の API
+
+| API | 用途 |
+| :--- | :--- |
+| `req.originalUrl` / `req.baseUrl` / `req.path` | 実際に受け取ったパスと Router マウントの関係を把握する |
+| `req.params` / `req.query` / `req.body` | 値の出所を区別する (`params`/`query` は常に string) |
+| `req.get(name)` / `req.is(type)` | 受信ヘッダーと Content-Type の判定 |
+| `req.ip` / `req.protocol` / `req.secure` | プロキシ配下でのクライアント情報 (`app.set('trust proxy', 1)` とセット) |
+| `res.headersSent` | 二重送信の検知 |
+| `res.on('finish')` / `res.on('close')` | 送信完了 / クライアント切断の検知 |
+| `app._router.stack` | 登録済みルートの一覧 (内部 API。恒久用途は `express-list-endpoints`) |
+| `next(err)` | エラーハンドラへ渡す |
+| `console.dir(obj, { depth: null })` | 省略なしで表示 |
+| `console.table` / `console.time` / `console.trace` | 表形式 / 所要時間 / 呼び出し元 |
+| `util.inspect(obj, { depth: null })` | 文字列化してログに載せる |
+| `process.memoryUsage()` | rss / heapUsed の推移 |
+| `perf_hooks.monitorEventLoopDelay()` | イベントループ遅延 |
+| `AsyncLocalStorage` | reqId などの文脈を層をまたいで伝播 |
+| `process.on('unhandledRejection' / 'uncaughtException')` | 最終防衛線での記録 |
+
+### Node 起動フラグ / 環境変数
+
+| フラグ・変数 | 用途 |
+| :--- | :--- |
+| `--inspect` / `--inspect-brk` | デバッガ接続 (`-brk` は 1 行目で停止) |
+| `--watch` | ファイル変更で自動再起動 |
+| `--enable-source-maps` | スタックトレースを元ソースの行番号に戻す |
+| `--trace-warnings` | 警告の発生元スタックを表示 |
+| `--cpu-prof` / `--heap-prof` | CPU / ヒーププロファイルの出力 |
+| `--env-file=.env` | .env の読み込み (対応バージョンのみ) |
+| `DEBUG=express:*` | Express 内部のルーティング判定ログ |
+| `NODE_DEBUG=http,net` | Node コアの HTTP / ソケットログ |
+| `NODE_ENV` | エラー詳細の出し分けなど |
+
+### 外部ツール
+
+| ツール | 用途 |
+| :--- | :--- |
+| `curl -i` / `-v` / `-w` | ヘッダー確認 / 送受信の全容 / タイミング計測 |
+| VS Code REST Client (`.http`) | 確認用リクエストをリポジトリに残す |
+| `npx prisma studio` | DB の実データ確認 |
+| `npx pino-pretty` | JSON ログの整形 |
+| `npx autocannon` | 負荷テスト |
+| `jest --detectOpenHandles` | 終了しないテストの原因特定 |
+| Chrome DevTools | `.cpuprofile` / `.heapprofile` の閲覧、inspector 接続 |
+
+## 📖 推奨学習リソース
+
+*   [Express 公式サイト](https://expressjs.com/) - まずは公式のガイドを読むのが最も確実です。
+*   [Express エラーハンドリング](https://expressjs.com/ja/guide/error-handling.html) - エラーハンドラの仕様はここが一次情報。
+*   [MDN Web Docs: Express Node.js web application framework](https://developer.mozilla.org/ja/docs/Learn/Server-side/Express_Nodejs) - 初心者向けの非常に丁寧なチュートリアル。
+*   [Node.js Debugging Guide](https://nodejs.org/en/learn/getting-started/debugging) - インスペクタとデバッガの公式解説。
+*   [Prisma ドキュメント](https://www.prisma.io/docs) - DB連携時の ORM として。
+*   [Zod ドキュメント](https://zod.dev/) - スキーマ定義とバリデーションに。
+*   [pino ドキュメント](https://getpino.io/) - 構造化ロギング。
